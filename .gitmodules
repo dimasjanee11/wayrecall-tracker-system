@@ -1,4 +1,4 @@
 [submodule "services/connection-manager"]
 	path = services/connection-manager
-	url = https://github.com/latulippepauline/wayrecall-connection-manager.git
+	url = https://github.com/dimasjanee11/connection-manager.git
 	branch = master
