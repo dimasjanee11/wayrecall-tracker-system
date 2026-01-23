@@ -30,6 +30,8 @@ build/
 # Environment
 .env
 .env.local
+test-stand/.env
+test-stand/credentials.md
 
 # OS
 .DS_Store
