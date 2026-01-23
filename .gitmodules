@@ -2,3 +2,6 @@
 	path = services/connection-manager
 	url = https://github.com/dimasjanee11/connection-manager.git
 	branch = master
+[submodule "services/device-manager"]
+	path = services/device-manager
+	url = https://github.com/dimasjanee11/device-manager.git
