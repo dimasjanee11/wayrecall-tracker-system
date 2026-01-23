@@ -9,13 +9,13 @@ echo "🗄️  Инициализация TimescaleDB..."
 # Переменные
 DB_HOST="localhost"
 DB_PORT="5432"
-DB_NAME="trackerdb"
+DB_NAME="tracker"
 DB_USER="tracker"
 DB_PASSWORD="tracker123"
 
 # Ожидание готовности PostgreSQL
 echo "⏳ Ожидание готовности TimescaleDB..."
-until docker exec wayrecall-timescaledb pg_isready -U $DB_USER; do
+until docker exec tracker-timescaledb pg_isready -U $DB_USER; do
   sleep 2
 done
 
@@ -24,7 +24,7 @@ echo ""
 
 # Выполнение SQL скрипта инициализации
 echo "📝 Выполнение SQL скрипта инициализации..."
-docker exec -i wayrecall-timescaledb psql -U $DB_USER -d $DB_NAME < infra/databases/timescaledb-init.sql
+docker exec -i tracker-timescaledb psql -U $DB_USER -d $DB_NAME < infra/databases/timescaledb-init.sql
 
 echo ""
 echo "✅ TimescaleDB инициализирована!"

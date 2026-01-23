@@ -158,16 +158,16 @@ Ctrl+b, d      - отключиться (сервисы продолжат ра�
 
 ```bash
 # Список топиков
-docker exec wayrecall-kafka kafka-topics.sh --list --bootstrap-server localhost:9092
+docker exec tracker-kafka kafka-topics.sh --list --bootstrap-server localhost:9092
 
 # Читать сообщения из топика
-docker exec -it wayrecall-kafka kafka-console-consumer.sh \
+docker exec -it tracker-kafka kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 \
   --topic gps-events \
   --from-beginning
 
 # Отправить тестовое сообщение
-echo "test-key:test-value" | docker exec -i wayrecall-kafka kafka-console-producer.sh \
+echo "test-key:test-value" | docker exec -i tracker-kafka kafka-console-producer.sh \
   --bootstrap-server localhost:9092 \
   --topic gps-events \
   --property "parse.key=true" \
@@ -178,27 +178,27 @@ echo "test-key:test-value" | docker exec -i wayrecall-kafka kafka-console-produc
 
 ```bash
 # Подключиться к Redis
-docker exec -it wayrecall-redis redis-cli
+docker exec -it tracker-redis redis-cli
 
 # Посмотреть все ключи
-docker exec wayrecall-redis redis-cli KEYS '*'
+docker exec tracker-redis redis-cli KEYS '*'
 
 # Получить последнюю позицию
-docker exec wayrecall-redis redis-cli GET "last_position:123456789012345"
+docker exec tracker-redis redis-cli GET "last_position:123456789012345"
 ```
 
 ### TimescaleDB
 
 ```bash
 # Подключиться к БД
-docker exec -it wayrecall-timescaledb psql -U tracker -d trackerdb
+docker exec -it tracker-timescaledb psql -U tracker -d tracker
 
 # Количество GPS позиций
-docker exec wayrecall-timescaledb psql -U tracker -d trackerdb \
+docker exec tracker-timescaledb psql -U tracker -d tracker \
   -c "SELECT COUNT(*) FROM gps_positions;"
 
 # Последние 10 позиций
-docker exec wayrecall-timescaledb psql -U tracker -d trackerdb \
+docker exec tracker-timescaledb psql -U tracker -d tracker \
   -c "SELECT time, imei, latitude, longitude, speed FROM gps_positions ORDER BY time DESC LIMIT 10;"
 ```
 

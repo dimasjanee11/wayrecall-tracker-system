@@ -7,7 +7,7 @@ set -e
 echo "📊 Создание Kafka топиков..."
 
 # Переменные
-KAFKA_CONTAINER="wayrecall-kafka"
+KAFKA_CONTAINER="tracker-kafka"
 PARTITIONS=12
 REPLICATION_FACTOR=1
 

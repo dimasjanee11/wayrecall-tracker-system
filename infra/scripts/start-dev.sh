@@ -38,11 +38,11 @@ tmux send-keys -t $SESSION_NAME:device-mgr "cd $PWD && sbt 'project device-manag
 
 # Окно 5: Kafka Console Consumer (для отладки)
 tmux new-window -t $SESSION_NAME -n "kafka-debug"
-tmux send-keys -t $SESSION_NAME:kafka-debug "docker exec -it wayrecall-kafka kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic gps-events --property print.key=true --property key.separator=':'" C-m
+tmux send-keys -t $SESSION_NAME:kafka-debug "docker exec -it tracker-kafka kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic gps-events --property print.key=true --property key.separator=':'" C-m
 
 # Окно 6: Redis CLI (для отладки)
 tmux new-window -t $SESSION_NAME -n "redis-debug"
-tmux send-keys -t $SESSION_NAME:redis-debug "docker exec -it wayrecall-redis redis-cli" C-m
+tmux send-keys -t $SESSION_NAME:redis-debug "docker exec -it tracker-redis redis-cli" C-m
 
 # Вернуться на первое окно
 tmux select-window -t $SESSION_NAME:infra
