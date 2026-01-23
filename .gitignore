@@ -1,0 +1,44 @@
+# Scala/SBT
+target/
+.classpath
+.project
+.settings/
+.worksheet
+*.class
+*.jar
+*.jar-stripped
+*.log
+
+# IDE
+.idea/
+*.iml
+*.iws
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build
+dist/
+build/
+.gradle/
+
+# Runtime
+.bsp/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (для frontend)
+node_modules/
+dist/
+*.pem
+
+# TimescaleDB
+pgdata/

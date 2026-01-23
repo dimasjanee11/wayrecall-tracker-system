@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+  # Redis - кэш, очереди команд, конфиг
+  redis:
+    image: redis:7-alpine
+    container_name: tracker-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Kafka - Event streaming
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: tracker-kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+
+  # ZooKeeper - для Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: tracker-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  # TimescaleDB - GPS история
+  timescaledb:
+    image: timescale/timescaledb-ha:latest-pg15
+    container_name: tracker-timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: tracker
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: tracker123
+      POSTGRES_INITDB_ARGS: "-c max_connections=200 -c shared_buffers=256MB"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-timescaledb.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Prometheus - мониторинг (опционально)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tracker-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # Grafana - дашборды (опционально)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tracker-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_SECURITY_ADMIN_USER: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    depends_on:
+      - prometheus
+
+volumes:
+  redis-data:
+  pgdata:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  default:
+    name: tracker-network
