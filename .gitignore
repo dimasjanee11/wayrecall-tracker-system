@@ -1,5 +1,7 @@
 # Scala/SBT
 target/
+project/target/
+project/project/
 .classpath
 .project
 .settings/
@@ -14,6 +16,8 @@ target/
 *.iml
 *.iws
 .vscode/
+.metals/
+.bloop/
 *.swp
 *.swo
 *~
