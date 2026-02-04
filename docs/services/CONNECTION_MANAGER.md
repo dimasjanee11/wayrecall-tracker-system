@@ -1,40 +1,217 @@
 # 🔌 Connection Manager — Детальная документация
 
 > **Блок:** 1 (Data Collection)  
-> **Порты:** TCP 5001-5004 (протоколы), HTTP 8090 (admin/metrics)  
+> **Порты:** TCP (один порт на инстанс, задаётся через CLI/env), HTTP 8090 (admin/metrics)  
 > **Сложность:** Высокая  
-> **Статус:** 🟡 В разработке
+> **Статус:** 🟡 В разработке  
+> **Обновлено:** 4 февраля 2026
 
 ---
 
 ## 📋 Содержание
 
 1. [Обзор](#обзор)
-2. [Архитектура компонентов](#архитектура-компонентов)
-3. [Протоколы трекеров](#протоколы-трекеров)
-4. [Обработка данных](#обработка-данных)
-5. [Redis интеграция](#redis-интеграция)
-6. [Kafka интеграция](#kafka-интеграция)
-7. [API endpoints](#api-endpoints)
-8. [Масштабирование](#масштабирование)
-9. [Метрики и мониторинг](#метрики-и-мониторинг)
-10. [Конфигурация](#конфигурация)
+2. [Принцип работы](#принцип-работы)
+3. [Запуск и конфигурация](#запуск-и-конфигурация)
+4. [Архитектура компонентов](#архитектура-компонентов)
+5. [Протоколы трекеров](#протоколы-трекеров)
+6. [Обработка данных](#обработка-данных)
+7. [Redis интеграция](#redis-интеграция)
+8. [Kafka интеграция](#kafka-интеграция)
+9. [API endpoints](#api-endpoints)
+10. [Масштабирование](#масштабирование)
+11. [Метрики и мониторинг](#метрики-и-мониторинг)
 
 ---
 
 ## Обзор
 
-**Connection Manager** — центральный сервис приёма GPS данных от трекеров. Обрабатывает TCP соединения, парсит протоколы, валидирует координаты и публикует события в Kafka.
+**Connection Manager** — сервис приёма GPS данных от трекеров. Каждый инстанс обслуживает **один протокол на одном порту**, что упрощает масштабирование и деплой.
 
 ### Ключевые характеристики
 
 | Параметр | Значение |
 |----------|----------|
-| **Протоколы** | Teltonika, Wialon IPS, Ruptela, NavTelecom |
-| **Пропускная способность** | 10,000+ точек/сек |
+| **Протоколы** | Teltonika, Wialon IPS, Ruptela, NavTelecom (+ 6 Post-MVP) |
+| **Deployment** | Один инстанс = один протокол + один порт |
+| **Пропускная способность** | 10,000+ точек/сек на инстанс |
 | **Latency** | < 50ms (parse → Kafka) |
-| **Concurrent connections** | 10,000+ |
-| **Stateless** | Да (state в Redis) |
+| **Concurrent connections** | 3,000+ на инстанс |
+| **State** | Redis (без локального состояния) |
+
+---
+
+## Принцип работы
+
+### Один инстанс — один протокол
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        DEPLOYMENT МОДЕЛЬ                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  docker run -e CM_PROTOCOL=teltonika -e CM_PORT=5001 cm:latest          │
+│  docker run -e CM_PROTOCOL=wialon    -e CM_PORT=5002 cm:latest          │
+│  docker run -e CM_PROTOCOL=ruptela   -e CM_PORT=5003 cm:latest          │
+│  docker run -e CM_PROTOCOL=navtelecom -e CM_PORT=5004 cm:latest         │
+│                                                                         │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │
+│  │ CM Instance │ │ CM Instance │ │ CM Instance │ │ CM Instance │        │
+│  │ Teltonika   │ │ Wialon      │ │ Ruptela     │ │ NavTelecom  │        │
+│  │ :5001       │ │ :5002       │ │ :5003       │ │ :5004       │        │
+│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘ └──────┬──────┘        │
+│         │               │               │               │               │
+│         └───────────────┴───────┬───────┴───────────────┘               │
+│                                 ↓                                       │
+│                         ┌─────────────┐                                 │
+│                         │    Redis    │  ← Shared state                 │
+│                         │   (HASH)    │  ← device:{imei}                │
+│                         └─────────────┘                                 │
+│                                 ↓                                       │
+│                         ┌─────────────┐                                 │
+│                         │    Kafka    │  ← gps-events                   │
+│                         │             │  ← gps-events-rules             │
+│                         └─────────────┘                                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         CONNECTION MANAGER FLOW                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. TCP CONNECT + IMEI PACKET                                           │
+│     ─────────────────────────                                           │
+│     Трекер → TCP → parseImei() → Redis HGETALL device:{imei}            │
+│                                                                         │
+│     Результат = null → NACK + close (неизвестный трекер)                │
+│     Результат = DeviceData → ACK + записываем connection поля           │
+│                                                                         │
+│  2. DATA PACKET (loop)                                                  │
+│     ──────────────────                                                  │
+│     ┌─────────────────────────────────────────────────────────────┐     │
+│     │ 2.1 PARSE                                                   │     │
+│     │     parseData(buffer) → List[GpsRawPoint]                   │     │
+│     └─────────────────────────────────────────────────────────────┘     │
+│                                       ↓                                 │
+│     ┌─────────────────────────────────────────────────────────────┐     │
+│     │ 2.2 GET FRESH CONTEXT (на каждый пакет!)                    │     │
+│     │     Redis HGETALL device:{imei} → DeviceData                │     │
+│     │     (context + prev position за 1 запрос)                   │     │
+│     └─────────────────────────────────────────────────────────────┘     │
+│                                       ↓                                 │
+│     ┌─────────────────────────────────────────────────────────────┐     │
+│     │ 2.3 ENRICH                                                  │     │
+│     │     raw + context → GpsPoint                                │     │
+│     │     (vehicleId, orgId, speedLimit, hasGeozones, ...)        │     │
+│     └─────────────────────────────────────────────────────────────┘     │
+│                                       ↓                                 │
+│     ┌─────────────────────────────────────────────────────────────┐     │
+│     │ 2.4 VALIDATE + DEAD RECKONING FILTER                        │     │
+│     │     - Координаты валидны? Timestamp не в будущем?           │     │
+│     │     - Сравнение с prev position (из того же HGETALL)        │     │
+│     │     - Нет телепортации? Скорость < 300 км/ч?                │     │
+│     └─────────────────────────────────────────────────────────────┘     │
+│                                       ↓                                 │
+│     ┌─────────────────────────────────────────────────────────────┐     │
+│     │ 2.5 UPDATE REDIS (всегда, после валидации)                  │     │
+│     │     HMSET device:{imei} lat .. lon .. speed .. time ..      │     │
+│     │     (обновляем только position + lastActivity поля)         │     │
+│     └─────────────────────────────────────────────────────────────┘     │
+│                                       ↓                                 │
+│     ┌─────────────────────────────────────────────────────────────┐     │
+│     │ 2.6 KAFKA PUBLISH                                           │     │
+│     │                                                             │     │
+│     │     → gps-events (ВСЕГДА)                                   │     │
+│     │       Consumers: History Writer, WebSocket Service          │     │
+│     │                                                             │     │
+│     │     → gps-events-rules (если hasGeozones OR hasSpeedRules)  │     │
+│     │       Consumers: Geozones Service, Speed Alert Service      │     │
+│     │                                                             │     │
+│     └─────────────────────────────────────────────────────────────┘     │
+│                                       ↓                                 │
+│     ┌─────────────────────────────────────────────────────────────┐     │
+│     │ 2.7 ACK → трекеру, GOTO 2.1                                 │     │
+│     └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│  3. DISCONNECT                                                          │
+│     ──────────                                                          │
+│     Очищаем connection поля в Redis, публикуем device-status offline    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Запуск и конфигурация
+
+### CLI аргументы
+
+```bash
+# Полный формат
+./connection-manager --protocol=teltonika --port=5001 --host=0.0.0.0
+
+# Минимальный (host по умолчанию 0.0.0.0)
+./connection-manager --protocol=wialon --port=5002
+```
+
+### Environment Variables (для Docker)
+
+```bash
+# Обязательные
+CM_PROTOCOL=teltonika          # teltonika|wialon|ruptela|navtelecom
+CM_PORT=5001                   # TCP порт для трекеров
+
+# Инфраструктура
+REDIS_HOST=redis               # Redis сервер
+REDIS_PORT=6379
+KAFKA_BROKERS=kafka:9092       # Kafka брокеры
+
+# Опциональные
+CM_INSTANCE_ID=cm-teltonika-1  # ID инстанса (по умолчанию: hostname)
+CM_ADMIN_PORT=8090             # Порт для health/metrics
+TCP_WORKER_THREADS=4           # Netty worker threads
+TCP_BOSS_THREADS=1             # Netty boss threads
+LOG_LEVEL=INFO
+```
+
+### Docker Compose пример
+
+```yaml
+services:
+  cm-teltonika:
+    image: wayrecall/connection-manager:latest
+    ports:
+      - "5001:5001"
+      - "8091:8090"
+    environment:
+      - CM_PROTOCOL=teltonika
+      - CM_PORT=5001
+      - CM_INSTANCE_ID=cm-teltonika-1
+      - REDIS_HOST=redis
+      - KAFKA_BROKERS=kafka:9092
+    depends_on:
+      - redis
+      - kafka
+
+  cm-wialon:
+    image: wayrecall/connection-manager:latest
+    ports:
+      - "5002:5002"
+      - "8092:8090"
+    environment:
+      - CM_PROTOCOL=wialon
+      - CM_PORT=5002
+      - CM_INSTANCE_ID=cm-wialon-1
+      - REDIS_HOST=redis
+      - KAFKA_BROKERS=kafka:9092
+    depends_on:
+      - redis
+      - kafka
+```
 
 ---
 
@@ -289,15 +466,34 @@ flowchart LR
     E2 --> O1 & O2
 ```
 
-### GpsPoint структура
+### GpsRawPoint → GpsPoint (обогащение)
 
 ```scala
+/**
+ * Сырая точка из парсера (без контекста)
+ */
+case class GpsRawPoint(
+  imei: String,
+  latitude: Double,
+  longitude: Double,
+  altitude: Option[Int],
+  speed: Int,
+  course: Int,
+  satellites: Option[Int],
+  deviceTime: Instant,
+  sensors: SensorData
+)
+
+/**
+ * Обогащённая точка (для Redis + Kafka)
+ */
 case class GpsPoint(
-  // Идентификация
+  // Идентификация (из DeviceData context)
   vehicleId: Long,
+  organizationId: Long,
   imei: String,
   
-  // Координаты
+  // Координаты (из raw)
   latitude: Double,
   longitude: Double,
   altitude: Option[Int],
@@ -306,22 +502,54 @@ case class GpsPoint(
   satellites: Option[Int],
   
   // Время
-  deviceTime: Instant,      // Время на трекере
+  deviceTime: Instant,      // Время на трекере (из raw)
   serverTime: Instant,      // Время получения сервером
   
+  // Флаги для downstream (из DeviceData context)
+  speedLimit: Option[Int],        // Для проверки превышения
+  hasGeozones: Boolean,           // Маркер → gps-events-rules
+  hasSpeedRules: Boolean,         // Маркер → gps-events-rules
+  
+  // Статус (вычисляется)
+  isMoving: Boolean,              // Stationary filter
+  isValid: Boolean,               // Dead Reckoning filter
+  validationError: Option[String],
+  
+  // Датчики (из raw, возможно обогащённые калибровкой)
+  sensors: SensorData,
+  
   // Метаданные
-  protocol: Protocol,       // TELTONIKA, WIALON, etc.
-  protocolVersion: String,  // "codec8e", "ips2.0"
-  instanceId: String,       // "cm-instance-1"
-  
-  // Флаги валидации
-  isValid: Boolean,         // Прошёл Dead Reckoning
-  validationError: Option[String], // "TELEPORT", "INVALID_COORDS"
-  isMoving: Boolean,        // Едет или стоит
-  
-  // Датчики (опционально)
-  sensors: Option[SensorData]
+  protocol: String,               // Из CLI/env
+  instanceId: String              // Из CLI/env
 )
+
+/**
+ * Обогащение raw → enriched
+ */
+def enrich(raw: GpsRawPoint, context: DeviceData, protocol: String, instanceId: String): GpsPoint =
+  GpsPoint(
+    vehicleId = context.vehicleId,
+    organizationId = context.organizationId,
+    imei = raw.imei,
+    latitude = raw.latitude,
+    longitude = raw.longitude,
+    altitude = raw.altitude,
+    speed = raw.speed,
+    course = raw.course,
+    satellites = raw.satellites,
+    deviceTime = raw.deviceTime,
+    serverTime = Instant.now,
+    speedLimit = context.speedLimit,
+    hasGeozones = context.hasGeozones,
+    hasSpeedRules = context.hasSpeedRules,
+    isMoving = true,  // будет определено Stationary filter
+    isValid = true,   // будет определено Dead Reckoning filter
+    validationError = None,
+    sensors = raw.sensors,  // TODO: применить калибровку из context.sensorConfig
+    protocol = protocol,
+    instanceId = instanceId
+  )
+```
 
 case class SensorData(
   ignition: Option[Boolean],
@@ -461,99 +689,253 @@ object StationaryFilter {
 
 ## Redis интеграция
 
-### Структуры данных
+### Единая структура: `device:{imei}` (HASH)
+
+Все данные об устройстве хранятся в **одном HASH ключе**, что минимизирует количество запросов к Redis.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    REDIS (Connection Manager)                        │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  📍 ПОСЛЕДНИЕ ПОЗИЦИИ                                                │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Key:     position:{vehicle_id}                                     │
-│  Type:    STRING (JSON)                                             │
-│  TTL:     3600 секунд (1 час)                                       │
-│  Example: position:12345                                            │
-│  Value:   {                                                         │
-│             "lat": 55.751244,                                       │
-│             "lon": 37.618423,                                       │
-│             "speed": 45,                                            │
-│             "course": 180,                                          │
-│             "time": "2026-01-26T12:30:00Z",                         │
-│             "isMoving": true,                                       │
-│             "sensors": {"fuel": 45.5, "ignition": true}            │
-│           }                                                         │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  🔗 IMEI → VEHICLE_ID МАППИНГ                                        │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Key:     vehicle:{imei}                                            │
-│  Type:    STRING                                                    │
-│  TTL:     3600 секунд (1 час)                                       │
-│  Example: vehicle:860719020025346                                   │
-│  Value:   "12345"                                                   │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  🔌 РЕЕСТР ПОДКЛЮЧЕНИЙ                                               │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Key:     connection_registry                                       │
-│  Type:    HASH                                                      │
-│  TTL:     нет (cleanup при disconnect)                             │
-│  Example: HSET connection_registry 860719020025346 cm-instance-1   │
-│  Fields:  {imei} → {instance_id}                                   │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  📊 СТАТИСТИКА ИНСТАНСА                                             │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Key:     cm:stats:{instance_id}                                    │
-│  Type:    HASH                                                      │
-│  TTL:     60 секунд (heartbeat)                                    │
-│  Fields:  connections, points_per_sec, uptime, last_heartbeat      │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  📨 PUB/SUB: КОМАНДЫ ДЛЯ ТРЕКЕРОВ                                    │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Channel: commands:{instance_id}                                    │
-│  Message: {                                                         │
-│             "imei": "860719020025346",                              │
-│             "command": "setdigout",                                 │
-│             "params": {"output": 1, "value": 1},                   │
-│             "requestId": "uuid"                                     │
-│           }                                                         │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    REDIS: device:{imei} (HASH)                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ═══════════════════════════════════════════════════════════════════    │
+│  CONTEXT FIELDS (записывает Device Manager)                             │
+│  ═══════════════════════════════════════════════════════════════════    │
+│                                                                         │
+│  vehicleId        = "12345"          # Long, ID в PostgreSQL            │
+│  organizationId   = "100"            # Long, ID организации             │
+│  name             = "Газель АА123"   # Название ТС                      │
+│  speedLimit       = "90"             # Int или "" (нет лимита)          │
+│  hasGeozones      = "true"           # Boolean string                   │
+│  hasSpeedRules    = "false"          # Boolean string                   │
+│  fuelTankVolume   = "70"             # Double или ""                    │
+│  sensorConfig     = "{...}"          # JSON string                      │
+│                                                                         │
+│  ═══════════════════════════════════════════════════════════════════    │
+│  POSITION FIELDS (записывает Connection Manager)                        │
+│  ═══════════════════════════════════════════════════════════════════    │
+│                                                                         │
+│  lat              = "55.751244"      # Double                           │
+│  lon              = "37.618423"      # Double                           │
+│  speed            = "45"             # Int, км/ч                        │
+│  course           = "180"            # Int, 0-359                       │
+│  altitude         = "156"            # Int, метры                       │
+│  satellites       = "12"             # Int                              │
+│  time             = "2026-02-04T12:30:00Z"  # ISO8601 Instant           │
+│  isMoving         = "true"           # Boolean string                   │
+│  sensors          = '{"fuel":45.5,"ignition":true}'  # JSON             │
+│                                                                         │
+│  ═══════════════════════════════════════════════════════════════════    │
+│  CONNECTION FIELDS (записывает Connection Manager)                      │
+│  ═══════════════════════════════════════════════════════════════════    │
+│                                                                         │
+│  instanceId       = "cm-teltonika-1" # ID инстанса CM                   │
+│  protocol         = "teltonika"      # Протокол                         │
+│  connectedAt      = "2026-02-04T12:00:00Z"  # Время подключения         │
+│  lastActivity     = "2026-02-04T12:30:00Z"  # Последняя активность      │
+│  remoteAddress    = "1.2.3.4:54321"  # IP:port трекера                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Redis операции
+### Операции Redis
 
 ```scala
-trait ConnectionManagerRedis {
+// ═══════════════════════════════════════════════════════════════════════
+// DEVICE MANAGER (при создании/обновлении устройства)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Создание устройства
+HSET device:860719020025346
+  vehicleId "12345"
+  organizationId "100"
+  name "Газель АА123"
+  speedLimit "90"
+  hasGeozones "false"
+  hasSpeedRules "false"
+
+// Добавили геозону для этого ТС
+HSET device:860719020025346 hasGeozones "true"
+
+// Удаление устройства
+DEL device:860719020025346
+
+// ═══════════════════════════════════════════════════════════════════════
+// CONNECTION MANAGER
+// ═══════════════════════════════════════════════════════════════════════
+
+// 1. При CONNECT (IMEI пакет) — проверяем существование
+HGETALL device:860719020025346
+// → Если нет vehicleId → трекер неизвестен → NACK + close
+// → Если есть → ACK + записываем connection info:
+
+HMSET device:860719020025346
+  instanceId "cm-teltonika-1"
+  protocol "teltonika"
+  connectedAt "2026-02-04T12:00:00Z"
+  lastActivity "2026-02-04T12:00:00Z"
+  remoteAddress "1.2.3.4:54321"
+
+// 2. При DATA пакете (каждый раз — без кеширования!)
+HGETALL device:860719020025346
+// → Получаем ВСЁ: context + prev position за 1 запрос
+// → Гарантирует актуальность флагов (hasGeozones и т.д.)
+
+// 3. После обработки — обновляем только position поля
+HMSET device:860719020025346
+  lat "55.751244"
+  lon "37.618423"
+  speed "45"
+  course "180"
+  time "2026-02-04T12:30:15Z"
+  isMoving "true"
+  sensors '{"fuel":45.5,"ignition":true}'
+  lastActivity "2026-02-04T12:30:15Z"
+
+// 4. При DISCONNECT — очищаем connection поля
+HDEL device:860719020025346 instanceId connectedAt remoteAddress
+```
+
+### Синхронизация Redis с PostgreSQL (Device Manager)
+
+Device Manager запускает **ежедневный sync job** для гарантии консистентности:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    DEVICE MANAGER: Daily Sync Job                        │
+│                    (запускается раз в сутки, ~03:00)                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. SCAN Redis: получить все ключи device:*                             │
+│     SCAN 0 MATCH device:* COUNT 1000                                    │
+│                                                                         │
+│  2. Для каждого ключа:                                                  │
+│     - Извлечь IMEI из ключа                                             │
+│     - Проверить существование в PostgreSQL                              │
+│                                                                         │
+│  3. Если устройство УДАЛЕНО из БД:                                      │
+│     DEL device:{imei}                                                   │
+│     → Очистка orphan ключей                                             │
+│                                                                         │
+│  4. Если устройство ЕСТЬ в БД:                                          │
+│     - Сравнить context поля (vehicleId, orgId, speedLimit, flags)       │
+│     - Если расхождение → HMSET актуальными данными из БД                │
+│     → Исправление drift                                                 │
+│                                                                         │
+│  5. Проверить устройства в БД без ключа в Redis:                        │
+│     - SELECT * FROM devices WHERE NOT EXISTS in Redis                   │
+│     - Создать HASH с context полями                                     │
+│     → Восстановление пропущенных                                        │
+│                                                                         │
+│  Результат:                                                             │
+│  - Redis = source of truth для real-time данных                         │
+│  - PostgreSQL = source of truth для конфигурации                        │
+│  - Sync job гарантирует eventual consistency                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### TTL стратегия
+
+| Ключ | TTL | Причина |
+|------|-----|---------|
+| `device:{imei}` | **Нет** | Master data, управляется Device Manager |
+| Position поля | **Нет** | Обновляются при каждом пакете, `lastActivity` показывает актуальность |
+| Connection поля | **Нет** | Очищаются при disconnect, проверяются по `lastActivity` |
+
+**Определение offline на фронтенде:**
+```javascript
+const isOnline = device.lastActivity && 
+  (Date.now() - new Date(device.lastActivity).getTime()) < 5 * 60 * 1000;
+```
+
+### Scala структуры
+
+```scala
+/**
+ * Полные данные устройства из Redis HASH
+ * Ключ: device:{imei}
+ */
+case class DeviceData(
+  // === CONTEXT (Device Manager) ===
+  vehicleId: Long,
+  organizationId: Long,
+  name: String,
+  speedLimit: Option[Int],
+  hasGeozones: Boolean,
+  hasSpeedRules: Boolean,
+  fuelTankVolume: Option[Double],
+  sensorConfig: Option[SensorConfig],
   
-  // Позиции
-  def setPosition(vehicleId: Long, position: PositionJson): Task[Unit]
-  def getPosition(vehicleId: Long): Task[Option[PositionJson]]
+  // === POSITION (Connection Manager) ===
+  lat: Option[Double],
+  lon: Option[Double],
+  speed: Option[Int],
+  course: Option[Int],
+  altitude: Option[Int],
+  satellites: Option[Int],
+  time: Option[Instant],
+  isMoving: Option[Boolean],
+  sensors: Option[SensorData],
   
-  // IMEI маппинг
-  def getVehicleId(imei: String): Task[Option[Long]]
-  def setVehicleId(imei: String, vehicleId: Long): Task[Unit]
+  // === CONNECTION (Connection Manager) ===
+  instanceId: Option[String],
+  protocol: Option[String],
+  connectedAt: Option[Instant],
+  lastActivity: Option[Instant],
+  remoteAddress: Option[String]
+)
+
+object DeviceData:
+  /**
+   * Парсинг из Redis HASH (Map[String, String])
+   */
+  def fromRedisHash(hash: Map[String, String]): Option[DeviceData] =
+    for
+      vehicleId <- hash.get("vehicleId").flatMap(_.toLongOption)
+      orgId     <- hash.get("organizationId").flatMap(_.toLongOption)
+    yield DeviceData(
+      vehicleId = vehicleId,
+      organizationId = orgId,
+      name = hash.getOrElse("name", ""),
+      speedLimit = hash.get("speedLimit").filter(_.nonEmpty).flatMap(_.toIntOption),
+      hasGeozones = hash.get("hasGeozones").contains("true"),
+      hasSpeedRules = hash.get("hasSpeedRules").contains("true"),
+      fuelTankVolume = hash.get("fuelTankVolume").flatMap(_.toDoubleOption),
+      sensorConfig = hash.get("sensorConfig").flatMap(_.fromJson[SensorConfig].toOption),
+      
+      lat = hash.get("lat").flatMap(_.toDoubleOption),
+      lon = hash.get("lon").flatMap(_.toDoubleOption),
+      speed = hash.get("speed").flatMap(_.toIntOption),
+      course = hash.get("course").flatMap(_.toIntOption),
+      altitude = hash.get("altitude").flatMap(_.toIntOption),
+      satellites = hash.get("satellites").flatMap(_.toIntOption),
+      time = hash.get("time").flatMap(s => Try(Instant.parse(s)).toOption),
+      isMoving = hash.get("isMoving").map(_ == "true"),
+      sensors = hash.get("sensors").flatMap(_.fromJson[SensorData].toOption),
+      
+      instanceId = hash.get("instanceId").filter(_.nonEmpty),
+      protocol = hash.get("protocol"),
+      connectedAt = hash.get("connectedAt").flatMap(s => Try(Instant.parse(s)).toOption),
+      lastActivity = hash.get("lastActivity").flatMap(s => Try(Instant.parse(s)).toOption),
+      remoteAddress = hash.get("remoteAddress")
+    )
   
-  // Connection registry
-  def registerConnection(imei: String, instanceId: String): Task[Unit]
-  def unregisterConnection(imei: String): Task[Unit]
-  def getConnectionInstance(imei: String): Task[Option[String]]
-  def getAllConnections(instanceId: String): Task[List[String]]
-  
-  // Commands Pub/Sub
-  def subscribeToCommands(instanceId: String): ZStream[Any, Throwable, Command]
-  def publishCommandResponse(response: CommandResponse): Task[Unit]
-  
-  // Stats
-  def updateStats(instanceId: String, stats: InstanceStats): Task[Unit]
-}
+  /**
+   * Position поля для HMSET после обработки пакета
+   */
+  def positionToHash(point: GpsPoint): Map[String, String] =
+    Map(
+      "lat" -> point.latitude.toString,
+      "lon" -> point.longitude.toString,
+      "speed" -> point.speed.toString,
+      "course" -> point.course.toString,
+      "time" -> point.deviceTime.toString,
+      "isMoving" -> point.isMoving.toString,
+      "lastActivity" -> Instant.now.toString
+    ) ++ point.altitude.map(a => "altitude" -> a.toString)
+      ++ point.satellites.map(s => "satellites" -> s.toString)
+      ++ Some("sensors" -> point.sensors.toJson)
 ```
 
 ---
@@ -562,60 +944,107 @@ trait ConnectionManagerRedis {
 
 ### Топики
 
-| Топик | Партиции | Retention | Producer | Описание |
-|-------|----------|-----------|----------|----------|
-| `gps-events` | 12 | 7 дней | CM | ВСЕ GPS точки |
-| `gps-events-moving` | 6 | 1 день | CM | Только движение |
-| `device-status` | 3 | 30 дней | CM | Online/Offline |
-| `command-responses` | 3 | 7 дней | CM | Ответы на команды |
+| Топик | Партиции | Retention | Условие публикации | Consumers |
+|-------|----------|-----------|-------------------|-----------|
+| `gps-events` | 12 | 7 дней | **ВСЕ** валидные точки | History Writer, WebSocket Service |
+| `gps-events-rules` | 6 | 1 день | `hasGeozones=true` OR `hasSpeedRules=true` | Geozones Service, Speed Alert Service |
+| `device-status` | 3 | 30 дней | Connect/Disconnect | Notifications Service, History Writer |
+
+### Логика публикации
+
+```scala
+// После валидации и обновления Redis
+def publishToKafka(point: GpsPoint): Task[Unit] =
+  for
+    // 1. ВСЕГДА публикуем в основной топик
+    _ <- kafkaProducer.publish("gps-events", point.vehicleId.toString, point.toJson)
+    
+    // 2. Если есть правила — дублируем в топик для проверок
+    _ <- ZIO.when(point.hasGeozones || point.hasSpeedRules)(
+           kafkaProducer.publish("gps-events-rules", point.vehicleId.toString, point.toJson)
+         )
+  yield ()
+```
 
 ### Формат сообщений
 
 ```scala
-// gps-events / gps-events-moving
-case class GpsEventMessage(
+/**
+ * GPS точка для Kafka (обогащённая данными из DeviceData)
+ */
+case class GpsPoint(
+  // Идентификация
   vehicleId: Long,
+  organizationId: Long,
   imei: String,
+  
+  // Координаты
   latitude: Double,
   longitude: Double,
   altitude: Option[Int],
   speed: Int,
   course: Int,
   satellites: Option[Int],
+  
+  // Время
   deviceTime: Instant,
   serverTime: Instant,
-  protocol: String,
+  
+  // Флаги из контекста (для downstream сервисов)
+  speedLimit: Option[Int],        // Geozones Service проверит превышение
+  hasGeozones: Boolean,           // Маркер для фильтрации
+  hasSpeedRules: Boolean,         // Маркер для фильтрации
+  
+  // Статус
+  isMoving: Boolean,
   isValid: Boolean,
   validationError: Option[String],
-  isMoving: Boolean,
-  sensors: Option[JsonObject]
+  
+  // Датчики
+  sensors: SensorData,
+  
+  // Метаданные
+  protocol: String,
+  instanceId: String
 )
 
 // Partitioning key: vehicleId.toString
-// Гарантирует что все точки одной машины идут в одну партицию (ordering)
+// Гарантирует ordering всех точек одной машины
 
-// device-status
+/**
+ * Статус устройства (online/offline)
+ */
 case class DeviceStatusMessage(
   vehicleId: Long,
   imei: String,
   status: String,         // "online" | "offline"
   timestamp: Instant,
   instanceId: String,
+  protocol: String,
   connectionDuration: Option[Long],  // секунд (для offline)
   disconnectReason: Option[String]   // "timeout", "error", "normal"
 )
+```
 
-// command-responses
-case class CommandResponseMessage(
-  requestId: String,
-  vehicleId: Long,
-  imei: String,
-  command: String,
-  status: String,         // "success" | "error" | "timeout"
-  response: Option[String],
-  errorMessage: Option[String],
-  timestamp: Instant
-)
+### Анализ трафика
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Предположение: 30% машин имеют геозоны или правила скорости            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  10,000 точек/сек:                                                      │
+│  ├─ gps-events:       10,000 точек/сек (100%)                           │
+│  └─ gps-events-rules:  3,000 точек/сек (30%)                            │
+│                                                                         │
+│  Итого: 1.3x трафик (вместо 3x при трёх топиках)                        │
+│  ✅ Приемлемо!                                                          │
+│                                                                         │
+│  При 200 байт/точка:                                                    │
+│  ├─ gps-events:       ~2 MB/sec → ~170 GB/day                           │
+│  └─ gps-events-rules: ~0.6 MB/sec → ~50 GB/day                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Producer конфигурация

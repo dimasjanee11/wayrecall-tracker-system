@@ -1,7 +1,53 @@
 # 💾 Data Stores: Схемы хранилищ
 
 > **Документ описывает:** TimescaleDB, PostgreSQL, Redis, Kafka  
-> **Версия:** 2.0
+> **Версия:** 3.0
+
+---
+
+## 📊 Расчёт объёмов хранения
+
+### Входные данные
+| Параметр | Значение |
+|----------|----------|
+| Количество трекеров | 10,000 |
+| Точек/сек на трекер | 1 (движущиеся ~30%) |
+| Размер GPS точки | ~200 bytes (JSON) |
+| Рабочие часы | 24/7 |
+
+### Потоки данных
+| Поток | Расчёт | Объём/сек | Объём/день |
+|-------|--------|-----------|------------|
+| **gps-events** | 10K × 1 | ~2 MB/sec | ~170 GB |
+| **gps-events-rules** | ~3K × 1 (30% с геозонами) | ~0.6 MB/sec | ~50 GB |
+
+### TimescaleDB (со сжатием 15x)
+| Период | Сырые | Сжатые | Retention |
+|--------|-------|--------|-----------|
+| 1 день | 170 GB | ~11 GB | ✅ |
+| 7 дней | 1.2 TB | ~80 GB | Compression starts |
+| 30 дней | 5.1 TB | ~340 GB | ✅ |
+| 90 дней | 15.3 TB | **~1 TB** | Retention policy |
+
+### Kafka
+| Топик | Retention | Расчёт | Объём |
+|-------|-----------|--------|-------|
+| gps-events | 7 дней | 170 GB × 7 | ~1.2 TB |
+| gps-events-rules | 7 дней | 50 GB × 7 | ~350 GB |
+| gps-events-unverified | 7 дней | ~1 GB × 7 (1% fail rate) | ~7 GB |
+| geozone-events | 30 дней | ~1 GB × 30 | ~30 GB |
+| device-status | 7 дней | ~100 MB × 7 | ~700 MB |
+
+**Итого Kafka:** ~1.6 TB (нормально для одного брокера)
+
+### Redis
+| Структура | Расчёт | Объём |
+|-----------|--------|-------|
+| device:{imei} × 10K | ~500 bytes × 10K | ~5 MB |
+| pending_commands | ~1KB × 1K (avg) | ~1 MB |
+| command_status | ~200 bytes × 10K | ~2 MB |
+
+**Итого Redis:** ~10-50 MB (negligible)
 
 ---
 
@@ -15,7 +61,7 @@
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                        TimescaleDB + PostGIS                         │   │
 │  │                                                                       │   │
-│  │   • gps_points (hypertable) — GPS точки, 10GB/день                  │   │
+│  │   • gps_points (hypertable) — GPS точки, ~11 GB/день (сжатые)       │   │
 │  │   • sensor_data (hypertable) — Данные датчиков                      │   │
 │  │   • geozones (PostGIS) — Геозоны с геометрией                       │   │
 │  │   • geozone_events — События входа/выхода                           │   │
@@ -38,23 +84,23 @@
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                             Redis 7                                   │   │
 │  │                                                                       │   │
-│  │   • pos:{imei} — Последняя позиция (HASH)                           │   │
-│  │   • conn:{imei} — Активное подключение (HASH)                       │   │
-│  │   • geozone:state:{device_id} — Состояние геозон (HASH)             │   │
-│  │   • grid:{hash} — Spatial Grid Cache (LIST)                         │   │
-│  │   • pending-cmd:{imei} — Очередь команд (ZSET)                      │   │
-│  │   • Pub/Sub каналы для команд и events                              │   │
+│  │   • device:{imei} — HASH (context + position + connection)          │   │
+│  │   • pending_commands:{imei} — Очередь команд (ZSET)                 │   │
+│  │   • command_status:{requestId} — Статус команды (HASH)              │   │
+│  │   • unknown:{imei}:attempts — Rate limiting (STRING + TTL)          │   │
+│  │   • Pub/Sub каналы для команд                                        │   │
 │  │                                                                       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                          Apache Kafka                                 │   │
 │  │                                                                       │   │
-│  │   • gps-events (12 partitions) — GPS точки                          │   │
-│  │   • geozone-events (6 partitions) — События геозон                  │   │
-│  │   • sensor-events (6 partitions) — События датчиков                 │   │
-│  │   • alerts (6 partitions) — Алерты                                  │   │
-│  │   • command-audit-log (3 partitions) — Аудит команд                 │   │
+│  │   • gps-events (12 partitions, 7 days) — Все GPS точки              │   │
+│  │   • gps-events-rules (6 partitions, 7 days) — Точки с геозонами     │   │
+│  │   • gps-events-unverified (6 partitions, 7 days) — DLQ              │   │
+│  │   • device-status (6 partitions, 7 days) — Online/offline           │   │
+│  │   • geozone-events (6 partitions, 30 days) — Enter/leave            │   │
+│  │   • command-audit (3 partitions, 90 days) — Аудит команд            │   │
 │  │                                                                       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -703,107 +749,60 @@ appendfsync everysec
 
 ### Структуры данных
 
-#### pos:{imei} — Последняя позиция (HASH)
+#### device:{imei} — Данные устройства (HASH)
+
+**Единый ключ для всех данных устройства.** Записывается двумя сервисами:
+- **Device Manager** — context поля (при CRUD)
+- **Connection Manager** — position + connection поля (при работе трекера)
 
 ```redis
-# Структура
-HSET pos:860123456789012 \
+# === CONTEXT поля (Device Manager пишет) ===
+HMSET device:860123456789012 \
+    vehicleId 123 \
+    organizationId 456 \
+    name "Грузовик-001" \
+    speedLimit 90 \
+    hasGeozones true \
+    hasSpeedRules false \
+    fuelTankVolume 200
+
+# === POSITION поля (Connection Manager пишет) ===
+HMSET device:860123456789012 \
     lat 55.7558 \
     lon 37.6173 \
     speed 45 \
     course 180 \
     altitude 150 \
     satellites 12 \
-    timestamp 1706270400 \
-    valid 1
+    time 1706270400 \
+    isMoving true \
+    lastActivity 1706270450
 
-EXPIRE pos:860123456789012 86400  # 1 день
-
-# Чтение
-HGETALL pos:860123456789012
-
-# Размер: ~200 bytes per device
-# 10,000 devices = ~2 MB
-```
-
-#### conn:{imei} — Активное подключение (HASH)
-
-```redis
-# Структура
-HSET conn:860123456789012 \
-    node_id "cm-node-1" \
+# === CONNECTION поля (Connection Manager пишет) ===
+HMSET device:860123456789012 \
+    instanceId "cm-teltonika-01" \
     protocol "teltonika" \
-    connected_at 1706270000 \
-    last_packet_at 1706270350 \
-    packets_count 150
+    connectedAt 1706270000 \
+    remoteAddress "192.168.1.100:54321"
 
-EXPIRE conn:860123456789012 300  # 5 минут, обновляется
+# Чтение всех данных (один запрос!)
+HGETALL device:860123456789012
 
-# Проверка онлайн
-EXISTS conn:860123456789012
+# Размер: ~500 bytes per device
+# 10,000 devices = ~5 MB
 
-# Размер: ~100 bytes per connection
-# 5,000 online devices = ~500 KB
+# БЕЗ TTL — данные персистентные
+# Device Manager удаляет при DELETE устройства
 ```
 
-#### imei:valid:{imei} — IMEI whitelist (STRING)
-
-```redis
-# Структура (быстрая проверка при подключении)
-SET imei:valid:860123456789012 "123:456"  # device_id:org_id
-EXPIRE imei:valid:860123456789012 3600    # 1 час
-
-# Или как HASH для дополнительных данных
-HSET imei:valid:860123456789012 \
-    device_id 123 \
-    org_id 456 \
-    protocol "teltonika"
-
-# Размер: ~50 bytes per IMEI
-# 10,000 devices = ~500 KB
-```
-
-#### geozone:state:{device_id} — Состояние геозон (HASH)
-
-```redis
-# Структура
-HSET geozone:state:123 \
-    inside_zones "[1,2,5]" \
-    last_lat 55.7558 \
-    last_lon 37.6173 \
-    last_check 1706270400
-
-EXPIRE geozone:state:123 86400  # 1 день
-
-# Размер: ~100 bytes per device
-# 10,000 devices = ~1 MB
-```
-
-#### grid:{hash} — Spatial Grid Cache (LIST of zone IDs)
-
-```redis
-# Структура (zone_ids в ячейке сетки)
-SET grid:u8vhg5 "[1,5,12,45]"
-EXPIRE grid:u8vhg5 3600  # 1 час
-
-# Или как SET для быстрых операций
-SADD grid:u8vhg5 1 5 12 45
-EXPIRE grid:u8vhg5 3600
-
-# Размер сетки для Москвы (0.003° ячейки):
-# ~700 x 700 = 490,000 ячеек (теоретически)
-# На практике покрыто ~10-15% = ~50,000 ячеек
-# ~50 bytes per cell = ~2.5 MB
-
-# Общий размер с зонами: ~7 MB для Москвы
-```
-
-#### pending-cmd:{imei} — Очередь команд (ZSET)
+#### pending_commands:{imei} — Очередь команд (ZSET)
 
 ```redis
 # Структура (score = timestamp, для порядка)
-ZADD pending-cmd:860123456789012 1706270400 \
+ZADD pending_commands:860123456789012 1706270400 \
     '{"id":123,"type":"reboot","payload":{}}'
+
+EXPIRE pending_commands:860123456789012 86400  # 24 часа
 
 # Получить все команды для устройства
 ZRANGE pending-cmd:860123456789012 0 -1
@@ -848,6 +847,19 @@ PUBSUB NUMSUB cmd:860123456789012
 
 ## 📨 Apache Kafka
 
+### Расчёт нагрузки
+
+| Топик | Msg/sec | Размер | Throughput | Retention | Объём |
+|-------|---------|--------|------------|-----------|-------|
+| gps-events | 10,000 | ~200B | ~2 MB/s | 7 дней | ~1.2 TB |
+| gps-events-rules | 3,000 | ~200B | ~0.6 MB/s | 7 дней | ~350 GB |
+| gps-events-unverified | 100 | ~350B | ~35 KB/s | 7 дней | ~20 GB |
+| device-status | 100 | ~150B | ~15 KB/s | 7 дней | ~10 GB |
+| geozone-events | 500 | ~200B | ~100 KB/s | 30 дней | ~250 GB |
+| command-audit | 50 | ~300B | ~15 KB/s | 90 дней | ~100 GB |
+
+**Общий объём Kafka:** ~2 TB (нормально для одного брокера)
+
 ### Конфигурация кластера
 
 ```yaml
@@ -865,16 +877,16 @@ kafka:
     KAFKA_NUM_PARTITIONS: 6
     KAFKA_DEFAULT_REPLICATION_FACTOR: 1
     KAFKA_LOG_RETENTION_HOURS: 168  # 7 дней
+    KAFKA_LOG_RETENTION_BYTES: 2147483648000  # 2 TB
 ```
 
 ### Topics
 
-#### gps-events
+#### gps-events (основной поток)
 
-**Назначение:** Основной поток GPS точек
+**Назначение:** ВСЕ GPS точки для History Writer → TimescaleDB
 
 ```bash
-# Создание топика
 kafka-topics --create \
   --topic gps-events \
   --partitions 12 \
@@ -887,32 +899,156 @@ kafka-topics --create \
 **Schema (JSON):**
 ```json
 {
-  "device_id": 123,
+  "vehicleId": 123,
+  "organizationId": 456,
   "imei": "860123456789012",
-  "timestamp": "2026-01-26T12:00:00Z",
-  "server_time": "2026-01-26T12:00:01Z",
+  "timestamp": 1706270400000,
   "lat": 55.7558,
   "lon": 37.6173,
   "speed": 45,
   "course": 180,
   "altitude": 150,
   "satellites": 12,
-  "valid": true,
   "protocol": "teltonika",
-  "io_data": {
-    "66": 12500,
-    "67": 4100,
-    "239": 1
-  }
+  "isMoving": true,
+  "io_data": {"66": 12500, "67": 4100}
 }
 ```
 
-**Partitioning:** По `device_id % 12` — гарантирует порядок для одного устройства
+**Partitioning:** `hash(vehicleId) % 12` — гарантирует порядок для одного устройства
 
-**Производительность:**
-- 10,000 сообщений/сек
-- Средний размер: ~300 bytes
-- Throughput: ~3 MB/sec
+#### gps-events-rules (для бизнес-логики)
+
+**Назначение:** Точки с флагами `hasGeozones=true` ИЛИ `hasSpeedRules=true`  
+**Consumer:** Geozones Service, Speed Rules Engine
+
+```bash
+kafka-topics --create \
+  --topic gps-events-rules \
+  --partitions 6 \
+  --replication-factor 1 \
+  --config retention.ms=604800000 \
+  --config cleanup.policy=delete \
+  --config compression.type=lz4
+```
+
+**Schema (JSON) — тот же что и gps-events:**
+```json
+{
+  "vehicleId": 123,
+  "organizationId": 456,
+  "imei": "860123456789012",
+  "timestamp": 1706270400000,
+  "lat": 55.7558,
+  "lon": 37.6173,
+  "speed": 45,
+  "hasGeozones": true,
+  "hasSpeedRules": false,
+  "speedLimit": 90
+}
+```
+
+**Логика публикации (Connection Manager):**
+```scala
+// Публикуем в gps-events-rules только если есть правила
+if (deviceData.hasGeozones || deviceData.hasSpeedRules)
+  kafkaProducer.publish("gps-events-rules", enrichedPoint)
+```
+
+#### gps-events-unverified (DLQ)
+
+**Назначение:** Dead Letter Queue для GPS точек, которые не удалось верифицировать  
+**Producer:** Connection Manager  
+**Consumer:** History Writer (для повторной обработки) или Admin Service (для мониторинга)
+
+**Когда используется:**
+- Redis недоступен (circuit breaker открыт)
+- Устройство не зарегистрировано в системе
+- Устройство деактивировано
+- Ошибка валидации точки
+- Несовпадение organizationId
+- Ошибка парсинга протокола
+
+```bash
+kafka-topics --create \
+  --topic gps-events-unverified \
+  --partitions 6 \
+  --replication-factor 1 \
+  --config retention.ms=604800000 \
+  --config cleanup.policy=delete \
+  --config compression.type=lz4
+```
+
+**Schema (JSON):**
+```json
+{
+  "imei": "860123456789012",
+  "protocol": "teltonika",
+  "remoteAddress": "192.168.1.100:54321",
+  "timestamp": 1706270400000,
+  "lat": 55.7558,
+  "lon": 37.6173,
+  "speed": 45,
+  "course": 180,
+  "altitude": 150,
+  "satellites": 12,
+  "gpsTime": 1706270390000,
+  "reason": "RedisUnavailable",
+  "errorMessage": "Circuit breaker is open after 5 failures",
+  "receivedAt": 1706270400000,
+  "retryCount": 0
+}
+```
+
+**UnverifiedReason enum:**
+| Reason | Описание |
+|--------|----------|
+| `RedisUnavailable` | Circuit breaker Redis открыт, нет доступа к кэшу устройств |
+| `DeviceNotFound` | IMEI не найден в Redis (устройство не зарегистрировано) |
+| `DeviceInactive` | Устройство деактивировано администратором |
+| `ValidationFailed` | Точка не прошла валидацию (невалидные координаты, скорость, и т.д.) |
+| `OrganizationMismatch` | Несовпадение organizationId (потенциальная атака) |
+| `ParseError` | Ошибка парсинга бинарного протокола |
+
+**Логика обработки (History Writer):**
+```scala
+// Переодически читаем из DLQ и пытаемся повторно верифицировать
+def processDlqBatch(events: List[UnverifiedGpsEvent]): Task[Unit] = for {
+  verified <- ZIO.foreach(events) { event =>
+    verifyDevice(event.imei).map {
+      case Some(device) => Right(event.toGpsPoint(device))
+      case None         => Left(event.copy(retryCount = event.retryCount + 1))
+    }
+  }
+  // Успешно верифицированные → gps-events
+  // Неуспешные с retryCount < 3 → обратно в DLQ
+  // Неуспешные с retryCount >= 3 → unknown-devices или discard
+} yield ()
+```
+
+#### device-status
+
+**Назначение:** Online/offline события от Connection Manager
+
+```bash
+kafka-topics --create \
+  --topic device-status \
+  --partitions 6 \
+  --replication-factor 1 \
+  --config retention.ms=604800000
+```
+
+**Schema:**
+```json
+{
+  "imei": "860123456789012",
+  "vehicleId": 123,
+  "isOnline": true,
+  "lastSeen": 1706270400000,
+  "disconnectReason": null,
+  "sessionDurationMs": null
+}
+```
 
 #### geozone-events
 

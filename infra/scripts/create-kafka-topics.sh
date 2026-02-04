@@ -35,6 +35,8 @@ create_topic "device-commands" 6        # Команды на устройств
 create_topic "geozone-events" 6         # События геозон (въезд/выезд)
 create_topic "notifications" 3          # Уведомления пользователям
 create_topic "device-status" 6          # Статусы устройств (online/offline)
+create_topic "unknown-devices" 3        # Попытки подключения неизвестных устройств
+create_topic "gps-events-unverified" 6  # DLQ для точек без проверки (Redis недоступен)
 
 echo ""
 echo "✅ Все топики созданы!"

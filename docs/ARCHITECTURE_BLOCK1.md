@@ -204,14 +204,15 @@ sequenceDiagram
     CM->>CM: Accept connection
     
     T->>CM: Login packet (IMEI)
-    CM->>R: GET device:{imei}
-    R-->>CM: Device config
+    CM->>R: HGETALL device:{imei}
+    R-->>CM: DeviceData (context + prev position)
     
-    alt IMEI найден
+    alt vehicleId exists
         CM->>CM: Store connection in memory
-        CM->>R: SET conn:{imei} = {nodeId, timestamp}
+        CM->>R: HMSET device:{imei} instanceId, protocol, connectedAt, remoteAddress
         CM-->>T: ACK (login success)
-    else IMEI не найден
+    else vehicleId not found
+        CM->>R: INCR unknown:{imei}:attempts
         CM-->>T: NACK (reject)
         CM->>CM: Close connection
     end
@@ -219,42 +220,68 @@ sequenceDiagram
     loop GPS пакеты
         T->>CM: GPS packet (N points)
         CM->>CM: Parse protocol
-        CM->>CM: Validate & Filter
-        CM->>K: Publish to gps-events
-        CM->>R: SET pos:{imei} = {lat, lon, speed, ts}
+        CM->>CM: Dead Reckoning + Stationary Filter
+        CM->>R: HMSET device:{imei} lat, lon, speed, time, isMoving, lastActivity
+        CM->>K: Produce gps-events (ALL points)
+        CM->>K: Produce gps-events-rules (if hasGeozones OR hasSpeedRules)
         CM-->>T: ACK
     end
 
     T->>CM: Disconnect / Timeout
-    CM->>R: DEL conn:{imei}
+    CM->>R: HDEL device:{imei} instanceId, protocol, connectedAt, remoteAddress
     CM->>CM: Cleanup connection
 ```
 
-### Redis структуры
+### Redis структуры (HASH per device)
+
+> **Важно:** Все данные устройства хранятся в ОДНОМ HASH ключе `device:{imei}`.  
+> Это снижает сетевой RTT (1 HGETALL вместо 3 GET) и упрощает атомарность.
 
 ```
-# Последняя позиция устройства (для фильтрации и API)
-pos:{imei}
-  lat: 55.7558
-  lon: 37.6173
-  speed: 45.5
-  course: 180
-  timestamp: 1706270400
-  TTL: 86400 (1 день)
+device:{imei}                    # HASH (без TTL — Device Manager управляет)
+├── CONTEXT (Device Manager пишет при sync)
+│   ├── vehicleId           "123"
+│   ├── organizationId      "456"
+│   ├── name                "Truck-001"
+│   ├── speedLimit          "90"
+│   ├── hasGeozones         "true"
+│   ├── hasSpeedRules       "true"
+│   └── fuelTankVolume      "300"
+│
+├── POSITION (Connection Manager пишет при GPS пакете)
+│   ├── lat                 "55.7558"
+│   ├── lon                 "37.6173"
+│   ├── speed               "45.5"
+│   ├── course              "180"
+│   ├── altitude            "150"
+│   ├── satellites          "12"
+│   ├── time                "1706270400"
+│   ├── isMoving            "true"
+│   └── lastActivity        "1706270450"
+│
+└── CONNECTION (Connection Manager пишет при подключении, удаляет при disconnect)
+    ├── instanceId          "cm-node-1"
+    ├── protocol            "teltonika"
+    ├── connectedAt         "1706270000"
+    └── remoteAddress       "192.168.1.100:54321"
 
-# Активное подключение
-conn:{imei}
-  nodeId: "cm-node-1"
-  connectedAt: 1706270000
-  protocol: "teltonika"
-  TTL: 300 (5 минут, обновляется)
-
-# IMEI whitelist (для быстрой проверки)
-imei:valid:{imei}
-  deviceId: 123
-  orgId: 456
-  TTL: 3600 (1 час, обновляется Device Manager)
+# Вспомогательные ключи
+pending_commands:{imei}        # ZSET (TTL 24h) — очередь команд для offline устройств
+command_status:{requestId}     # HASH (TTL 1h) — статус выполнения команды
+unknown:{imei}:attempts        # STRING (TTL 1h) — счётчик попыток неизвестного IMEI
 ```
+
+### Kafka Topics (Block 1)
+
+| Топик | Partitions | Retention | Producer | Consumer |
+|-------|------------|-----------|----------|----------|
+| **gps-events** | 12 | 7 дней | Connection Manager | History Writer |
+| **gps-events-rules** | 6 | 7 дней | Connection Manager | Geozones Service |
+| device-status | 6 | 7 дней | Connection Manager | Device Manager |
+
+**Разделение потоков:**
+- `gps-events` — ВСЕ точки (~10K/sec) → History Writer → TimescaleDB
+- `gps-events-rules` — только устройства с геозонами (~30%) → Geozones Service
 
 ### Prometheus метрики
 

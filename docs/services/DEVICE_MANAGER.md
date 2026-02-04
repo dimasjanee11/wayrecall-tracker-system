@@ -750,6 +750,30 @@ GROUP BY organization_id;
 │                    REDIS (Device Manager)                            │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
+│  � ДАННЫЕ УСТРОЙСТВА (HASH)                                         │
+│  ─────────────────────────────────────────────────────────────────  │
+│  Key:     device:{imei}                                             │
+│  Type:    HASH                                                      │
+│  TTL:     Без TTL (персистентный)                                   │
+│                                                                     │
+│  CONTEXT поля (Device Manager пишет):                               │
+│    vehicleId        — ID транспортного средства                     │
+│    organizationId   — ID организации (multi-tenant)                 │
+│    name             — Название устройства                           │
+│    speedLimit       — Лимит скорости км/ч (опционально)             │
+│    hasGeozones      — Флаг: есть геозоны для проверки               │
+│    hasSpeedRules    — Флаг: есть правила скорости                   │
+│    fuelTankVolume   — Объём бака (литры)                            │
+│                                                                     │
+│  POSITION поля (Connection Manager пишет):                          │
+│    lat, lon, speed, course, altitude, satellites                   │
+│    time, isMoving, lastActivity                                    │
+│                                                                     │
+│  CONNECTION поля (Connection Manager пишет):                        │
+│    instanceId, protocol, connectedAt, remoteAddress                │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
 │  📨 ОЧЕРЕДЬ КОМАНД ДЛЯ ОФФЛАЙН УСТРОЙСТВ                             │
 │  ─────────────────────────────────────────────────────────────────  │
 │  Key:     pending_commands:{imei}                                   │
@@ -758,15 +782,6 @@ GROUP BY organization_id;
 │  TTL:     24 часа                                                   │
 │  Value:   JSON команды                                              │
 │  Example: ZADD pending_commands:860719020025346 1706270400 '{...}'  │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  📊 КЕШ УСТРОЙСТВ                                                    │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Key:     device:{id}                                               │
-│  Type:    HASH                                                      │
-│  TTL:     1 час                                                     │
-│  Fields:  imei, name, protocol, organization_id, enabled           │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
@@ -787,6 +802,102 @@ GROUP BY organization_id;
 │  Message:  {requestId, status, response, error}                    │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
+```
+
+### Device Manager → Redis: Запись контекста
+
+При CRUD операциях Device Manager обновляет **только CONTEXT поля** в HASH `device:{imei}`:
+
+```scala
+// При создании/обновлении устройства
+def syncDeviceToRedis(device: Device): Task[Unit] =
+  redis.hmset(s"device:${device.imei}", Map(
+    "vehicleId"       -> device.id.toString,
+    "organizationId"  -> device.organizationId.toString,
+    "name"            -> device.name,
+    "speedLimit"      -> device.speedLimit.map(_.toString).getOrElse(""),
+    "hasGeozones"     -> device.hasGeozones.toString,
+    "hasSpeedRules"   -> device.hasSpeedRules.toString,
+    "fuelTankVolume"  -> device.fuelTankVolume.map(_.toString).getOrElse("")
+  ))
+
+// При удалении устройства
+def removeDeviceFromRedis(imei: String): Task[Unit] =
+  redis.del(s"device:$imei")
+```
+
+### Daily Sync Job: Redis ↔ PostgreSQL
+
+Ежедневная синхронизация для обеспечения консистентности:
+
+```scala
+/**
+ * Daily Sync Job
+ * 
+ * Запускается раз в сутки (например, 03:00 UTC)
+ * Гарантирует консистентность Redis ↔ PostgreSQL
+ */
+def dailySyncJob: Task[SyncReport] = for {
+  // 1. Получаем все device:* ключи из Redis
+  redisKeys <- redis.keys("device:*")
+  redisImeis = redisKeys.map(_.stripPrefix("device:")).toSet
+  
+  // 2. Получаем все IMEI из PostgreSQL
+  dbDevices <- deviceRepository.findAllEnabled()
+  dbImeis = dbDevices.map(_.imei).toSet
+  
+  // 3. Находим расхождения
+  orphanedInRedis = redisImeis -- dbImeis    // Есть в Redis, нет в БД
+  missingInRedis = dbImeis -- redisImeis     // Есть в БД, нет в Redis
+  
+  // 4. Удаляем orphaned записи из Redis
+  _ <- ZIO.foreachDiscard(orphanedInRedis) { imei =>
+    redis.del(s"device:$imei") *>
+    ZIO.logWarning(s"[SYNC] Удалён orphaned ключ device:$imei")
+  }
+  
+  // 5. Добавляем недостающие записи в Redis
+  _ <- ZIO.foreachDiscard(missingInRedis) { imei =>
+    deviceRepository.findByImei(imei).flatMap {
+      case Some(device) => syncDeviceToRedis(device)
+      case None => ZIO.unit
+    } *>
+    ZIO.logInfo(s"[SYNC] Добавлен ключ device:$imei")
+  }
+  
+  // 6. Проверяем drift (расхождение данных) для существующих
+  driftCount <- ZIO.foldLeft(dbImeis.intersect(redisImeis))(0) { (count, imei) =>
+    for {
+      redisData <- redis.hgetall(s"device:$imei")
+      dbDevice <- deviceRepository.findByImei(imei)
+      hasDrift = dbDevice.exists { d =>
+        redisData.get("organizationId") != Some(d.organizationId.toString) ||
+        redisData.get("hasGeozones") != Some(d.hasGeozones.toString) ||
+        redisData.get("hasSpeedRules") != Some(d.hasSpeedRules.toString)
+      }
+      _ <- ZIO.when(hasDrift)(
+        dbDevice.traverse(syncDeviceToRedis) *>
+        ZIO.logWarning(s"[SYNC] Исправлен drift для device:$imei")
+      )
+    } yield if (hasDrift) count + 1 else count
+  }
+  
+  report = SyncReport(
+    orphanedDeleted = orphanedInRedis.size,
+    missingAdded = missingInRedis.size,
+    driftFixed = driftCount,
+    totalDevices = dbDevices.size
+  )
+  
+  _ <- ZIO.logInfo(s"[SYNC] Завершено: $report")
+} yield report
+
+case class SyncReport(
+  orphanedDeleted: Int,
+  missingAdded: Int,
+  driftFixed: Int,
+  totalDevices: Int
+)
 ```
 
 ### Обработка ответов на команды
