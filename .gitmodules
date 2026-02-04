@@ -8,3 +8,6 @@
 [submodule "services/history-writer"]
 	path = services/history-writer
 	url = https://github.com/dimasjanee11/history-writer.git
+[submodule "services/web-frontend"]
+	path = services/web-frontend
+	url = git@github-dimasjanee11:dimasjanee11/web-frontend.git
