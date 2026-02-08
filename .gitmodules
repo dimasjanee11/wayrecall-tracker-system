@@ -14,3 +14,6 @@
 [submodule "services/web-billing"]
 	path = services/web-billing
 	url = git@github-dimasjanee11:dimasjanee11/web-billing.git
+[submodule "services/API-Gateway"]
+	path = services/API-Gateway
+	url = git@github-dimasjanee11:dimasjanee11/api-gateway.git
