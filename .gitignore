@@ -31,6 +31,15 @@ build/
 # Runtime
 .bsp/
 
+# Legacy (хранится локально, не в git — см. docs/LEGACY_STELS_RUNBOOK.md)
+legacy-stels/
+
+# Vite cache
+.vite/
+
+# SBT
+project/
+
 # Environment
 .env
 .env.local

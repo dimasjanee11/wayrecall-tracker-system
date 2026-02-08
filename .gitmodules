@@ -11,3 +11,6 @@
 [submodule "services/web-frontend"]
 	path = services/web-frontend
 	url = git@github-dimasjanee11:dimasjanee11/web-frontend.git
+[submodule "services/web-billing"]
+	path = services/web-billing
+	url = git@github-dimasjanee11:dimasjanee11/web-billing.git
